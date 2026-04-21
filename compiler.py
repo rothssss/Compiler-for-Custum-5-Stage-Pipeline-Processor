@@ -6,7 +6,7 @@
 import re
 import sys
 
-# opcode table 
+# opcode table
 OPCODES = {
     "NOP":  0b0000,
     "ADD":  0b0001,
@@ -31,6 +31,8 @@ REGS = {
     "SP": 6, "RA": 7,
 }
 
+MAX_INSTRUCTIONS = 16  
+
 # ---- assembler stuff ----
 
 def parse_reg(text):
@@ -40,14 +42,12 @@ def parse_reg(text):
     raise Exception(f"unknown register: {text}")
 
 def parse_imm(text, bits, signed=True):
-    # clean up the text and parse the number
     text = text.strip().strip(",").lstrip("#")
     if text.startswith("0x"):
         val = int(text, 16)
     else:
         val = int(text)
 
-    # check if its in range
     if signed:
         low = -(1 << (bits - 1))
         high = (1 << (bits - 1)) - 1
@@ -57,11 +57,10 @@ def parse_imm(text, bits, signed=True):
     if val < low or val > high:
         raise Exception(f"immediate {val} out of range [{low}, {high}]")
 
-    # mask to correct number of bits (handles negative -> twos complement)
     return val & ((1 << bits) - 1)
 
 def assemble_one(mnemonic, ops):
-    # encode a single instruction into 16 bits
+    # instruction formats (matches decode.v):
     #   R-type (ADD/AND/XOR): [opcode:4][rd:3][rs:3][rt:3][000]
     #   NOT:                  [opcode:4][rd:3][rs:3][000000]
     #   ADDI:                 [opcode:4][rd:3][rs:3][imm:6]
@@ -69,8 +68,8 @@ def assemble_one(mnemonic, ops):
     #   JAL:                  [opcode:4][rd:3][imm:9]
     #   RET:                  [opcode:4][000][rs:3][000000]
     #   BNEZ:                 [opcode:4][rs:3][rt:3][offset:6]
-    #   LD:                   [opcode:4][rs:3][offset:9]
-    #   ST:                   [opcode:4][rs:3][rt:3][offset:6]
+    #   LD:                   [opcode:4][rd:3][rs:3][offset:6]  (rd = mem[rs + offset])
+    #   ST:                   [opcode:4][rs:3][rt:3][offset:6]  (mem[rs + offset] = rt)
 
     op = OPCODES[mnemonic]
     word = op << 12
@@ -98,7 +97,7 @@ def assemble_one(mnemonic, ops):
     elif mnemonic in ("SR", "SL"):
         rd = parse_reg(ops[0])
         rs = parse_reg(ops[1])
-        mod = parse_imm(ops[2], 1, signed=False)  # 0=logical 1=arithmetic
+        mod = parse_imm(ops[2], 1, signed=False)
         shamt = parse_imm(ops[3], 5, signed=False)
         return word | (rd << 9) | (rs << 6) | (mod << 5) | shamt
 
@@ -118,11 +117,14 @@ def assemble_one(mnemonic, ops):
         return word | (rs << 9) | (rt << 6) | offset
 
     elif mnemonic == "LD":
-        rs = parse_reg(ops[0])
-        offset = parse_imm(ops[1], 9)
-        return word | (rs << 9) | offset
+        # LD rd, rs, offset  ->  rd = mem[rs + offset]
+        rd = parse_reg(ops[0])
+        rs = parse_reg(ops[1])
+        offset = parse_imm(ops[2], 6)
+        return word | (rd << 9) | (rs << 6) | offset
 
     elif mnemonic == "ST":
+        # ST rs, rt, offset  ->  mem[rs + offset] = rt
         rs = parse_reg(ops[0])
         rt = parse_reg(ops[1])
         offset = parse_imm(ops[2], 6)
@@ -131,18 +133,16 @@ def assemble_one(mnemonic, ops):
 def assemble(source):
     lines = source.strip().splitlines()
 
-    # first pass - find all the labels and their addresses
+    # first pass - find labels
     labels = {}
     instructions = []
     addr = 0
 
     for raw in lines:
-        # strip comments (after ; or //)
         line = raw.split(";")[0].split("//")[0].strip()
         if not line:
             continue
 
-        # check for labels like "loop:"
         label_match = re.match(r"^(\w+):\s*(.*)", line)
         if label_match:
             labels[label_match.group(1).upper()] = addr
@@ -150,11 +150,13 @@ def assemble(source):
             if not line:
                 continue
 
-        # split into tokens
         tokens = re.split(r"[,\s]+", line)
         tokens = [t for t in tokens if t]
         instructions.append((tokens[0].upper(), tokens[1:], addr))
         addr += 1
+
+    if addr > MAX_INSTRUCTIONS:
+        raise Exception(f"program has {addr} instructions, max is {MAX_INSTRUCTIONS}")
 
     # second pass - resolve labels and encode
     machine_code = []
@@ -163,7 +165,6 @@ def assemble(source):
         for o in ops:
             key = o.strip().strip(",").lstrip("#").upper()
             if key in labels:
-                # for branches use PC-relative offset
                 if mnemonic == "BNEZ":
                     resolved.append(str(labels[key] - (iaddr + 1)))
                 else:
@@ -174,11 +175,10 @@ def assemble(source):
 
     return machine_code
 
-# ---- C compiler  ----
-# supports: int x = 5; assignment; if/else; while; +,-,*,&,^,~,<<,>>; halt;
+# ---- C compiler ----
+# supports: int, assignment, if/else, while, +,-,*,&,^,~,<<,>>; halt;
 # variables get mapped to R1-R5
 
-# tokenizer regex 
 TOKEN_REGEX = re.compile("|".join(f"(?P<{n}>{p})" for n, p in [
     ("NUM",     r"0x[0-9a-fA-F]+|\d+"),
     ("ID",      r"[a-zA-Z_]\w*"),
@@ -224,8 +224,6 @@ def tokenize(source):
     tokens.append(("EOF", None, line))
     return tokens
 
-# parser - turns tokens into a simple tree made of tuples
-
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
@@ -269,7 +267,7 @@ class Parser:
             raise Exception(f"line {tok[2]}: unexpected '{tok[1]}'")
 
     def parse_var_decl(self):
-        self.advance()  # eat 'int'
+        self.advance()
         name = self.expect("ID")[1]
         init = None
         if self.peek()[0] == "ASSIGN":
@@ -286,7 +284,7 @@ class Parser:
         return ("assign", name, expr)
 
     def parse_if(self):
-        self.advance()  # eat 'if'
+        self.advance()
         self.expect("LPAREN")
         cond = self.parse_condition()
         self.expect("RPAREN")
@@ -295,7 +293,6 @@ class Parser:
         while self.peek()[0] != "RBRACE":
             body.append(self.parse_statement())
         self.expect("RBRACE")
-        # check for else
         else_body = []
         if self.peek()[0] == "ID" and self.peek()[1] == "else":
             self.advance()
@@ -306,7 +303,7 @@ class Parser:
         return ("if", cond, body, else_body)
 
     def parse_while(self):
-        self.advance()  # eat 'while'
+        self.advance()
         self.expect("LPAREN")
         cond = self.parse_condition()
         self.expect("RPAREN")
@@ -325,10 +322,8 @@ class Parser:
         elif self.peek()[0] == "EQ":
             self.advance()
             return ("==", left, self.parse_expr())
-        # bare expression = "expr != 0"
         return ("!=", left, ("num", 0))
 
-    # expression parsing - each level handles one precedence tier
     def parse_expr(self):
         return self.parse_bitwise()
 
@@ -388,13 +383,11 @@ class Parser:
         raise Exception(f"line {tok[2]}: unexpected '{tok[1]}' in expression")
 
 
-# code generator - walks the parse tree and spits out assembly
-# maps C variables to registers R1-R5
 class CodeGen:
     def __init__(self):
-        self.lines = []          # output assembly lines
-        self.var_map = {}        # variable name -> register
-        self.next_reg = 1        # next register to assign
+        self.lines = []
+        self.var_map = {}
+        self.next_reg = 1
         self.label_count = 0
 
     def new_label(self):
@@ -405,7 +398,6 @@ class CodeGen:
         self.lines.append(line)
 
     def alloc(self, name):
-        # assign a register to a new variable
         if name in self.var_map:
             return self.var_map[name]
         if self.next_reg > 5:
@@ -421,7 +413,6 @@ class CodeGen:
         return self.var_map[name]
 
     def temp(self):
-        # find an unused register for scratch work
         for i in range(5, 0, -1):
             if f"R{i}" not in self.var_map.values():
                 return f"R{i}"
@@ -430,7 +421,6 @@ class CodeGen:
     def compile(self, stmts):
         for s in stmts:
             self.compile_stmt(s)
-        # make sure we end with HALT
         if not self.lines or "HALT" not in self.lines[-1].upper():
             self.emit("HALT")
         return "\n".join(self.lines)
@@ -441,7 +431,7 @@ class CodeGen:
             if stmt[2] is not None:
                 self.compile_expr(stmt[2], reg)
             else:
-                self.emit(f"ADD {reg}, R0, R0")  # init to 0
+                self.emit(f"ADD {reg}, R0, R0")
         elif stmt[0] == "assign":
             self.compile_expr(stmt[2], self.get(stmt[1]))
         elif stmt[0] == "if":
@@ -457,30 +447,24 @@ class CodeGen:
             if val == 0:
                 self.emit(f"ADD {dest}, R0, R0")
             elif -32 <= val <= 31:
-                # small enough to fit in ADDI immediate
                 self.emit(f"ADDI {dest}, R0, {val}")
             else:
                 self.build_constant(dest, val)
-
         elif expr[0] == "var":
             src = self.get(expr[1])
             if src != dest:
-                self.emit(f"ADD {dest}, {src}, R0")  # copy
-
+                self.emit(f"ADD {dest}, {src}, R0")
         elif expr[0] == "unary":
             self.compile_expr(expr[2], dest)
             if expr[1] == "~":
                 self.emit(f"NOT {dest}, {dest}")
             elif expr[1] == "-":
-                # negate = NOT + 1 (twos complement)
                 self.emit(f"NOT {dest}, {dest}")
                 self.emit(f"ADDI {dest}, {dest}, 1")
-
         elif expr[0] == "binop":
             self.compile_binop(expr[1], expr[2], expr[3], dest)
 
     def compile_binop(self, op, left, right, dest):
-        # multiplication - no MUL instruction so we use shift+add
         if op == "*":
             if right[0] == "num":
                 self.compile_expr(left, dest)
@@ -489,10 +473,9 @@ class CodeGen:
                 self.compile_expr(right, dest)
                 self.compile_mul(dest, left[1])
             else:
-                raise Exception("multiply needs at least one constant (e.g. x * 3)")
+                raise Exception("multiply needs at least one constant")
             return
 
-        # add/sub small constant -> ADDI
         if op == "+" and right[0] == "num" and -32 <= right[1] <= 31:
             self.compile_expr(left, dest)
             self.emit(f"ADDI {dest}, {dest}, {right[1]}")
@@ -502,7 +485,6 @@ class CodeGen:
             self.emit(f"ADDI {dest}, {dest}, {-right[1]}")
             return
 
-        # shift by constant
         if op in ("<<", ">>") and right[0] == "num":
             self.compile_expr(left, dest)
             instr = "SL" if op == "<<" else "SR"
@@ -516,7 +498,6 @@ class CodeGen:
         if op == "+":
             self.emit(f"ADD {dest}, {dest}, {t}")
         elif op == "-":
-            # subtract = negate then add
             self.emit(f"NOT {t}, {t}")
             self.emit(f"ADDI {t}, {t}, 1")
             self.emit(f"ADD {dest}, {dest}, {t}")
@@ -526,7 +507,6 @@ class CodeGen:
             self.emit(f"XOR {dest}, {dest}, {t}")
 
     def compile_mul(self, dest, n):
-        # multiply dest register by constant n using shifts and adds
         if n == 0:
             self.emit(f"ADD {dest}, R0, R0")
             return
@@ -537,9 +517,8 @@ class CodeGen:
             return
 
         t = self.temp()
-        self.emit(f"ADD {t}, {dest}, R0")  # save original
+        self.emit(f"ADD {t}, {dest}, R0")
 
-        # figure out which bits are set in n
         set_bits = []
         for i in range(16):
             if n & (1 << i):
@@ -622,19 +601,15 @@ class CodeGen:
         self.emit(f"{end}:")
 
     def eval_condition(self, cond, t):
-        # put a value in t thats nonzero when condition is true
         if cond[2][0] == "num" and cond[2][1] == 0:
-            # comparing to 0, just load the value
             self.compile_expr(cond[1], t)
         else:
-            # XOR the two sides - result is 0 if equal, nonzero if different
             self.compile_expr(cond[1], t)
             t2 = self.temp()
             self.compile_expr(cond[2], t2)
             self.emit(f"XOR {t}, {t}, {t2}")
 
     def build_constant(self, dest, val):
-        # load a constant bigger than 31 using ADDI + shift + ADDI
         if val <= 31:
             self.emit(f"ADDI {dest}, R0, {val}")
             return
